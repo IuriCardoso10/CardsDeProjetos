@@ -1,0 +1,193 @@
+import os
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+
+class ProcessadorETL:
+    def __init__(self, caminho_csv: str):
+        self.caminho_csv = caminho_csv
+        self.df_tratado = None
+
+    def extrair_e_tratar(self) -> pd.DataFrame:
+        """Lê os dados brutos, remove duplicatas, trata nulos e padroniza tipos."""
+        print("[1/4] Extraindo e limpando dados brutos...")
+        
+        # Leitura dos dados
+        df = pd.read_csv(self.caminho_csv)
+
+        # 1. Remoção de duplicatas exatas
+        df = df.drop_duplicates()
+
+        # 2. Tratamento de strings (remoção de espaços extras)
+        colunas_texto = df.select_dtypes(include=['object']).columns
+        for col in colunas_texto:
+            df[col] = df[col].astype(str).str.strip()
+
+        # 3. Tratamento de valores ausentes / inconsistentes
+        if 'codigo_produto' in df.columns:
+            df['codigo_produto'] = df['codigo_produto'].fillna('N/A').str.upper()
+
+        if 'quantidade_divergente' in df.columns:
+            df['quantidade_divergente'] = pd.to_numeric(df['quantidade_divergente'], errors='coerce').fillna(0).astype(int)
+
+        if 'valor_prejuizo' in df.columns:
+            df['valor_prejuizo'] = pd.to_numeric(df['valor_prejuizo'], errors='coerce').fillna(0.0)
+
+        # 4. Filtro de segurança: remover linhas sem identificação básica
+        df = df[df['codigo_produto'] != 'N/A']
+
+        self.df_tratado = df
+        print(f"   -> Limpeza concluída. {len(self.df_tratado)} registros válidos.")
+        return self.df_tratado
+
+    def exportar_excel_formatado(self, caminho_saida: str):
+        """Gera um arquivo Excel estilizado para apresentação operacional."""
+        if self.df_tratado is None:
+            raise ValueError("Execute 'extrair_e_tratar' antes de exportar.")
+
+        print("[2/4] Gerando planilha Excel formatada...")
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Divergências Auditadas"
+
+        # Adiciona cabeçalhos e linhas do DataFrame
+        for r in dataframe_to_rows(self.df_tratado, index=False, header=True):
+            ws.append(r)
+
+        # Estilização profissional
+        cor_header = "1F4E79"  # Azul escuro corporativo
+        fonte_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        fill_header = PatternFill(start_color=cor_header, end_color=cor_header, fill_type="solid")
+        
+        border_fina = Side(style='thin', color='D9D9D9')
+        borda_celula = Border(left=border_fina, right=border_fina, top=border_fina, bottom=border_fina)
+
+        # Formata Cabeçalho
+        for cell in ws[1]:
+            cell.font = fonte_header
+            cell.fill = fill_header
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Formata Dados e Ajusta Largura de Colunas
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                cell.border = borda_celula
+                cell.alignment = Alignment(vertical="center")
+
+        # Auto-ajuste do tamanho das colunas
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = openpyxl.utils.get_column_letter(col[0].column)
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+        wb.save(caminho_saida)
+        print(f"   -> Arquivo salvo em: {caminho_saida}")
+
+
+class EnviadorEmail:
+    def __init__(self, smtp_server: str, port: int, remetente: str, senha: str):
+        self.smtp_server = smtp_server
+        self.port = port
+        self.remetente = remetente
+        self.senha = senha
+
+    def enviar_relatorio(self, destinatario: str, assunto: str, df_resumo: pd.DataFrame, caminho_anexo: str):
+        """Monta o corpo do e-mail em HTML com resumo executivo e envia com anexo."""
+        print("[3/4] Preparando e-mail de notificação...")
+
+        msg = MIMEMultipart()
+        msg['From'] = self.remetente
+        msg['To'] = destinatario
+        msg['Subject'] = assunto
+
+        # Resumo métrico para o corpo do e-mail
+        total_itens = len(df_resumo)
+        total_prejuizo = df_resumo['valor_prejuizo'].sum() if 'valor_prejuizo' in df_resumo.columns else 0.0
+
+        corpo_html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; color: #333;">
+            <h2>Relatório Automático de Divergências de Estoque</h2>
+            <p>Prezados,</p>
+            <p>A rotina automatizada de auditoria de dados foi executada com sucesso. Abaixo segue o resumo operacional:</p>
+            
+            <table style="border-collapse: collapse; width: 300px; margin: 15px 0;">
+                <tr style="background-color: #f2f2f2;">
+                    <td style="padding: 8px; border: 1px solid #ddd;"><b>Total de Ocorrências:</b></td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{total_itens}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px; border: 1px solid #ddd;"><b>Prejuízo Estimado:</b></td>
+                    <td style="padding: 8px; border: 1px solid #ddd; color: #d9534f;"><b>R$ {total_prejuizo:,.2f}</b></td>
+                </tr>
+            </table>
+
+            <p>O detalhamento completo dos produtos afetados e códigos SKU encontra-se no arquivo <b>.xlsx</b> anexado a esta mensagem.</p>
+            <br>
+            <p><small>Este é um e-mail automático gerado pelo pipeline de ETL em Python. Por favor, não responda.</small></p>
+        </body>
+        </html>
+        """
+
+        msg.attach(MIMEText(corpo_html, 'html'))
+
+        # Anexo do Excel
+        if os.path.exists(caminho_anexo):
+            with open(caminho_anexo, 'rb') as f:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(caminho_anexo)}"')
+                msg.attach(part)
+
+        print("[4/4] Enviando e-mail via SMTP...")
+        try:
+            with smtplib.SMTP(self.smtp_server, self.port) as server:
+                server.starttls()
+                server.login(self.remetente, self.senha)
+                server.send_message(msg)
+            print("   -> E-mail enviado com sucesso!")
+        except Exception as e:
+            print(f"   -> Erro ao enviar e-mail: {e}")
+
+
+# --- EXECUÇÃO DO PIPELINE ---
+if __name__ == "__main__":
+    # Configurações de arquivos
+    ARQUIVO_ENTRADA = "dados_brutos.csv"
+    ARQUIVO_SAIDA = "Relatorio_Divergencias_Auditado.xlsx"
+
+    # Criar dados simulados caso o CSV não exista
+    if not os.path.exists(ARQUIVO_ENTRADA):
+        dados_simulados = {
+            "codigo_produto": ["SKU-001", "SKU-002", "SKU-001", None, "SKU-003 ", "SKU-004"],
+            "descricao": [" Carne Bovina ", " Frango Isca ", " Carne Bovina ", "Item Invalido", " Arroz 5kg", "Feijao 1kg"],
+            "quantidade_divergente": [10, "5", 10, None, 2, "3"],
+            "valor_prejuizo": [150.50, 45.00, 150.50, 0.0, " 80.00 ", 25.00]
+        }
+        pd.DataFrame(dados_simulados).to_csv(ARQUIVO_ENTRADA, index=False)
+
+    # 1 e 2. Tratar Dados e Gerar Relatório
+    etl = ProcessadorETL(ARQUIVO_ENTRADA)
+    df_limpo = etl.extrair_e_tratar()
+    etl.exportar_excel_formatado(ARQUIVO_SAIDA)
+
+    # 3 e 4. Disparo de E-mail (Descomente e insira suas credenciais para testar o SMTP)
+    # CONFIG_SMTP = {
+    #     "smtp_server": "smtp.gmail.com",
+    #     "port": 587,
+    #     "remetente": "seu_email@gmail.com",
+    #     "senha": "sua_senha_de_app",
+    #     "destinatario": "gestor_operacoes@empresa.com"
+    # }
+    # enviador = EnviadorEmail(CONFIG_SMTP["smtp_server"], CONFIG_SMTP["port"], CONFIG_SMTP["remetente"], CONFIG_SMTP["senha"])
+    # enviador.enviar_relatorio(CONFIG_SMTP["destinatario"], "Relatório Diário de Divergências - Auditoria", df_limpo, ARQUIVO_SAIDA)
