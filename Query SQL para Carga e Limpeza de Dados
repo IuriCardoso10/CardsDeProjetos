@@ -1,0 +1,169 @@
+Query para consolidar e limpar os eventos de perdas e rupturas direto da base relacional:
+
+Design Funcional e Responsivo: Navegação por botões/ícones no topo, paleta de cores neutra (tons de cinza e azul escuro) com destaque em vermelho apenas para alertar indicadores fora da meta.
+
+Foco em Decisão Financeira: Transforma contagens de unidades perdidas em impacto direto na margem de lucro em R$.
+
+
+import sqlite3
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# Define a semente para garantir reprodutibilidade nos dados
+np.random.seed(42)
+
+def criar_banco_sql_e_exportar():
+    print("[1/5] Conectando ao Banco de Dados SQLite e criando tabelas...")
+    
+    # Conecta ou cria o arquivo do banco SQLite
+    conn = sqlite3.connect("prevencao_perdas.db")
+    cursor = conn.cursor()
+
+    # Habilita suporte a chaves estrangeiras no SQLite
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    # --- ESTRUTURA DO BANCO DE DADOS (DDL) ---
+    cursor.executescript("""
+        DROP TABLE IF EXISTS fMovimentacoes_Perdas;
+        DROP TABLE IF EXISTS dProdutos;
+        DROP TABLE IF EXISTS dLojas;  
+        DROP TABLE IF EXISTS dTipoOcorrencia;
+
+        CREATE TABLE dProdutos (
+            ID_Produto INTEGER PRIMARY KEY AUTOINCREMENT,
+            SKU TEXT UNIQUE NOT NULL,
+            Nome_Produto TEXT NOT NULL,
+            Categoria TEXT NOT NULL,
+            Custo_Unitario REAL NOT NULL
+        );
+
+        CREATE TABLE dLojas (
+            ID_Loja INTEGER PRIMARY KEY AUTOINCREMENT,
+            Nome_Loja TEXT NOT NULL,
+            Regional TEXT NOT NULL
+        );
+
+        CREATE TABLE dTipoOcorrencia (
+            ID_Tipo_Ocorrencia INTEGER PRIMARY KEY AUTOINCREMENT,
+            Tipo_Ocorrencia TEXT NOT NULL
+        );
+
+        CREATE TABLE fMovimentacoes_Perdas (
+            ID_Movimentacao INTEGER PRIMARY KEY AUTOINCREMENT,
+            Data TEXT NOT NULL,
+            ID_Produto INTEGER NOT NULL,
+            ID_Loja INTEGER NOT NULL,
+            ID_Tipo_Ocorrencia INTEGER NOT NULL,
+            Quantidade INTEGER NOT NULL,
+            Custo_Total REAL NOT NULL,
+            FOREIGN KEY (ID_Produto) REFERENCES dProdutos(ID_Produto),
+            FOREIGN KEY (ID_Loja) REFERENCES dLojas(ID_Loja),
+            FOREIGN KEY (ID_Tipo_Ocorrencia) REFERENCES dTipoOcorrencia(ID_Tipo_Ocorrencia)
+        );
+    """)
+    conn.commit()
+
+    print("[2/5] Gerando e inserindo dados nas tabelas dimensão...")
+
+    # 1. População de Produtos
+    categorias = ['Açougue', 'Mercearia', 'Hortifruti', 'Laticínios', 'Bebidas']
+    produtos_lista = []
+    for i in range(1, 51):
+        cat = np.random.choice(categorias)
+        custo = round(float(np.random.uniform(5.0, 120.0)), 2)
+        produtos_lista.append((f'SKU-{1000 + i}', f'Produto {cat} {i}', cat, custo))
+
+    cursor.executemany(
+        "INSERT INTO dProdutos (SKU, Nome_Produto, Categoria, Custo_Unitario) VALUES (?, ?, ?, ?)",
+        produtos_lista
+    )
+
+    # 2. População de Lojas
+    regionais = ['SP - Capital', 'SP - Interior', 'RJ - Metropolitana']
+    lojas_lista = []
+    for i in range(1, 11):
+        reg = np.random.choice(regionais)
+        lojas_lista.append((f'Loja Unidade {i:02d}', reg))
+
+    cursor.executemany(
+        "INSERT INTO dLojas (Nome_Loja, Regional) VALUES (?, ?)",
+        lojas_lista
+    )
+
+    # 3. População de Tipos de Ocorrência
+    ocorrencias_lista = [
+        ('Avaria',),
+        ('Validade Vencida',),
+        ('Furtos/Divergência',),
+        ('Ruptura (Falta em gôndola)',)
+    ]
+    cursor.executemany(
+        "INSERT INTO dTipoOcorrencia (Tipo_Ocorrencia) VALUES (?)",
+        ocorrencias_lista
+    )
+
+    conn.commit()
+
+    print("[3/5] Gerando e inserindo registros na tabela fato...")
+
+    # Carrega IDs inseridos para referenciar na fato
+    cursor.execute("SELECT ID_Produto, Custo_Unitario FROM dProdutos")
+    produtos_db = cursor.fetchall()  # Retorna tuplas (id, custo)
+
+    cursor.execute("SELECT ID_Loja FROM dLojas")
+    lojas_ids = [row[0] for row in cursor.fetchall()]
+
+    cursor.execute("SELECT ID_Tipo_Ocorrencia FROM dTipoOcorrencia")
+    ocorrencias_ids = [row[0] for row in cursor.fetchall()]
+
+    # Configuração de datas
+    data_inicio = datetime(2025, 1, 1)
+    dias_totais = 365
+    num_registros = 1500
+
+    movimentacoes_lista = []
+    for _ in range(num_registros):
+        dias_offset = int(np.random.randint(0, dias_totais))
+        data_registro = (data_inicio + timedelta(days=dias_offset)).strftime('%Y-%m-%d')
+        
+        # Seleção aleatória respeitando pesos
+        prod_id, custo_un = produtos_db[np.random.randint(0, len(produtos_db))]
+        loja_id = int(np.random.choice(lojas_ids))
+        ocorrencia_id = int(np.random.choice(ocorrencias_ids, p=[0.3, 0.3, 0.15, 0.25]))
+        
+        qtd = int(np.random.randint(1, 25))
+        custo_total = round(qtd * custo_un, 2)
+
+        movimentacoes_lista.append((data_registro, prod_id, loja_id, ocorrencia_id, qtd, custo_total))
+
+    cursor.executemany("""
+        INSERT INTO fMovimentacoes_Perdas 
+        (Data, ID_Produto, ID_Loja, ID_Tipo_Ocorrencia, Quantidade, Custo_Total)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, movimentacoes_lista)
+
+    conn.commit()
+
+    print("[4/5] Extraindo visões via SQL com Pandas para validar integridade...")
+    
+    # Leitura direta do Banco SQL usando Pandas
+    df_produtos = pd.read_sql_query("SELECT * FROM dProdutos", conn)
+    df_lojas = pd.read_sql_query("SELECT * FROM dLojas", conn)
+    df_ocorrencias = pd.read_sql_query("SELECT * FROM dTipoOcorrencia", conn)
+    df_fato = pd.read_sql_query("SELECT * FROM fMovimentacoes_Perdas", conn)
+
+    print("[5/5] Exportando tabelas para CSV...")
+    df_produtos.to_csv('dProdutos.csv', index=False, encoding='utf-8-sig')
+    df_lojas.to_csv('dLojas.csv', index=False, encoding='utf-8-sig')
+    df_ocorrencias.to_csv('dTipoOcorrencia.csv', index=False, encoding='utf-8-sig')
+    df_fato.to_csv('fMovimentacoes_Perdas.csv', index=False, encoding='utf-8-sig')
+
+    conn.close()
+    print("\n[SUCESSO] Processo concluído com êxito!")
+    print(" - Arquivo SQLite gerado: prevencao_perdas.db")
+    print(" - Arquivos CSV gerados: dProdutos.csv, dLojas.csv, dTipoOcorrencia.csv, fMovimentacoes_Perdas.csv")
+
+if __name__ == "__main__":
+    criar_banco_sql_e_exportar()
+ 
